@@ -20,12 +20,21 @@
           builtins.any (file: lib.hasPrefix "${relative}/" file) allowedFiles
         else type == "regular" && builtins.elem relative allowedFiles;
       src = builtins.path { path = ./.; name = "moonboot-source"; filter = sourceFilter; };
-      runtimeLibraries = [ pkgs.libGL pkgs.libxkbcommon pkgs.wayland ];
+      # Prefer the packaged notifier library over libraries inherited from a host app.
+      runtimeLibraries = [ pkgs.libGL pkgs.libxkbcommon pkgs.wayland pkgs.libnotify ];
       testBusConfig = pkgs.writeText "moonboot-test-bus.conf" ''
         <busconfig><type>session</type><listen>unix:tmpdir=/tmp</listen>
         <auth>EXTERNAL</auth><policy context="default">
         <allow send_destination="*"/><allow receive_sender="*"/><allow own="*"/>
         </policy></busconfig>
+      '';
+      conflictingNotifierLibrary = pkgs.runCommand "moonboot-conflicting-notifier" {
+        nativeBuildInputs = [ pkgs.stdenv.cc ];
+      } ''
+        mkdir -p "$out/lib"
+        cc -shared -fPIC -Wl,-soname,libnotify.so.4 \
+          -o "$out/lib/libnotify.so.4" \
+          ${pkgs.writeText "conflicting-notifier.c" "void unrelated_symbol(void) {}"}
       '';
       isolatedTests = ''
         export HOME="$TMPDIR/test-home"
@@ -106,6 +115,22 @@
           unset DISPLAY WAYLAND_DISPLAY DBUS_SESSION_BUS_ADDRESS
           ${lib.getExe moonboot} --help
           ${lib.getExe moonboot} --version
+          # Reach the private bus even without a notification daemon; loader failure
+          # must not be mistaken for the expected optional-service failure.
+          env -i HOME="$HOME" XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR" \
+            LD_LIBRARY_PATH="${lib.makeLibraryPath runtimeLibraries}:${conflictingNotifierLibrary}/lib" \
+            ${pkgs.dbus}/bin/dbus-run-session \
+            --dbus-daemon=${pkgs.dbus}/bin/dbus-daemon \
+            --config-file ${testBusConfig} -- ${pkgs.runtimeShell} -eu -c '
+              ${lib.getExe pkgs.libnotify} --version
+              status=0
+              output=$(${lib.getExe pkgs.libnotify} -- Moonboot "DEMO isolated notifier smoke" 2>&1) || status=$?
+              test "$status" -eq 1
+              case "$output" in
+                *GDBus.Error:org.freedesktop.DBus.Error.ServiceUnknown*) ;;
+                *) printf "%s\n" "$output" >&2; exit 1 ;;
+              esac
+            '
           # The package must start its inert demo tray outside the development shell.
           dbus-run-session --config-file ${testBusConfig} -- sh -c '
             PATH=/nonexistent ${lib.getExe moonboot} tray --demo success &
