@@ -1,0 +1,9 @@
+/target/
+/result
+/result-*
+/.direnv/
+/.env
+*credentials*.toml
+*secret*.toml
+/config.toml
+*.log
