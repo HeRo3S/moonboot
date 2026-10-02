@@ -28,6 +28,7 @@ toml = "0.8"
 [dev-dependencies]
 egui_kittest = { version = "=0.33.3", default-features = false }
 tempfile = "3"
+zbus = { version = "=5.19.0", default-features = false, features = ["blocking-api"] }
 
 [profile.release]
 strip = true

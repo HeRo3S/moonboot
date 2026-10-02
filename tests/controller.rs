@@ -74,6 +74,10 @@ fn isolated_child() {
         tray_child();
         return;
     }
+    if mode == "tray-recovery" {
+        tray_recovery_child();
+        return;
+    }
     assert_eq!(mode, "controller");
     let instance = Arc::new(Instance::claim(None).unwrap().unwrap());
     let demo_instance = Instance::claim(Some(Scenario::Success)).unwrap().unwrap();
@@ -432,4 +436,278 @@ fn tray_child() {
     assert!(wait(&mut process).success());
     standalone_worker.join().unwrap();
     assert_eq!(other.receive(), None);
+}
+
+struct Watcher(std::sync::mpsc::Sender<String>);
+
+#[zbus::interface(name = "org.kde.StatusNotifierWatcher")]
+impl Watcher {
+    fn register_status_notifier_item(&self, service: &str) {
+        self.0.send(service.to_owned()).unwrap();
+    }
+
+    #[zbus(property)]
+    fn is_status_notifier_host_registered(&self) -> bool {
+        true
+    }
+
+    #[zbus(property)]
+    fn protocol_version(&self) -> i32 {
+        0
+    }
+}
+
+// Reap subprocesses even when a protocol assertion panics.
+struct TestProcess(Child);
+
+impl Drop for TestProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn isolated_bus_tray_recovers_watcher_and_preserves_demo_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let bus_config = directory.path().join("test-bus.conf");
+    // No service activation directories: this bus cannot launch desktop/cloud services.
+    fs::write(&bus_config, format!("<busconfig><type>session</type><listen>unix:tmpdir={}</listen><auth>EXTERNAL</auth><policy context=\"default\"><allow send_destination=\"*\"/><allow receive_sender=\"*\"/><allow own=\"*\"/></policy></busconfig>", directory.path().display())).unwrap();
+    let mut process = TestProcess(
+        Command::new("dbus-run-session")
+            .arg("--config-file")
+            .arg(bus_config)
+            .arg("--")
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "isolated_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("MOONBOOT_TEST_CHILD", "tray-recovery")
+            .env("HOME", directory.path())
+            .env("XDG_RUNTIME_DIR", directory.path())
+            .env("XDG_CONFIG_HOME", directory.path())
+            .env("XDG_STATE_HOME", directory.path())
+            .env_remove("DBUS_SESSION_BUS_ADDRESS")
+            .env_remove("DBUS_STARTER_ADDRESS")
+            .env_remove("DBUS_STARTER_BUS_TYPE")
+            .env("DBUS_SYSTEM_BUS_ADDRESS", "unix:path=/nonexistent-test-bus")
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .stdin(Stdio::null())
+            .spawn()
+            .expect("tray recovery regression requires dbus-run-session"),
+    );
+    assert!(wait(&mut process.0).success());
+}
+
+fn tray_recovery_child() {
+    use std::collections::HashMap;
+    use zbus::{
+        blocking::{connection::Builder, Proxy},
+        zvariant::{OwnedObjectPath, OwnedValue},
+    };
+
+    let directory = std::path::PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+    let address = std::env::var("DBUS_SESSION_BUS_ADDRESS").unwrap();
+    assert!(address.contains(directory.to_str().unwrap()));
+    let connection = Builder::address(address.as_str())
+        .unwrap()
+        .method_timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let dbus = zbus::blocking::fdo::DBusProxy::new(&connection).unwrap();
+    assert!(!dbus
+        .name_has_owner("org.kde.StatusNotifierWatcher".try_into().unwrap())
+        .unwrap());
+
+    let config = directory.join("invalid-config.toml");
+    let credentials = directory.join("credentials.toml");
+    fs::write(&config, "invalid TOML: must not be read").unwrap();
+    fs::write(&credentials, "synthetic credentials: must not be read").unwrap();
+    let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+    assert!(fd >= 0);
+    let observer = unsafe { File::from_raw_fd(fd) };
+    for path in [&config, &credentials] {
+        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert!(
+            unsafe { libc::inotify_add_watch(observer.as_raw_fd(), path.as_ptr(), libc::IN_OPEN) }
+                >= 0
+        );
+    }
+    let stderr = directory.join("tray-stderr");
+    let mut process = TestProcess(
+        Command::new(env!("CARGO_BIN_EXE_moonboot"))
+            .args(["tray", "--demo", "success", "--config"])
+            .arg(&config)
+            .env("PATH", "/nonexistent-test-path")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(File::create(&stderr).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let pid = process.0.id();
+    let assert_idle = |process: &mut Child| {
+        assert_eq!(process.id(), pid);
+        assert!(process.try_wait().unwrap().is_none(), "tray exited");
+        // Missing-host diagnostics may briefly attempt the optional notifier.
+        // Wait for that failed exec to be reaped, rather than racing its fork.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+                .unwrap()
+                .trim()
+                .is_empty()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "tray retained a child process");
+            thread::sleep(Duration::from_millis(10));
+        }
+        for name in [
+            "moonboot-ui.sock",
+            "moonboot-demo-success-ui.sock",
+            "moonboot-ui.lock",
+            "moonboot-demo-success-ui.lock",
+            "moonboot-operation.lock",
+            "moonboot-demo-success-operation.lock",
+        ] {
+            assert!(!directory.join(name).exists(), "unexpected {name}");
+        }
+    };
+    let wait_diagnostic = |process: &mut Child, count| {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            assert_idle(process);
+            let diagnostic = fs::read_to_string(&stderr).unwrap();
+            if diagnostic.matches("Tray host unavailable.").count() >= count {
+                assert!(diagnostic.contains("Enable Waybar's tray module"));
+                assert!(diagnostic.contains("moonboot gui"));
+                assert!(diagnostic.contains("waiting for tray host recovery"));
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "missing diagnostic: {diagnostic}"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        // Let ksni install its NameOwnerChanged subscription after the callback.
+        thread::sleep(Duration::from_millis(200));
+        assert_idle(process);
+    };
+    wait_diagnostic(&mut process.0, 1);
+
+    let mut first_service = None;
+    for generation in 0..2 {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let watcher = Builder::address(address.as_str())
+            .unwrap()
+            .serve_at("/StatusNotifierWatcher", Watcher(tx))
+            .unwrap()
+            .name("org.kde.StatusNotifierWatcher")
+            .unwrap()
+            .build()
+            .unwrap();
+        let service = rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("tray did not register with replacement watcher");
+        assert_idle(&mut process.0);
+        let owner = dbus
+            .get_name_owner(service.as_str().try_into().unwrap())
+            .unwrap();
+        assert_eq!(
+            dbus.get_connection_unix_process_id(owner.into()).unwrap(),
+            pid
+        );
+        if let Some(first) = &first_service {
+            assert_eq!(&service, first, "recovery replaced the tray D-Bus identity");
+        } else {
+            first_service = Some(service.clone());
+        }
+        let item = Proxy::new(
+            &connection,
+            service.as_str(),
+            "/StatusNotifierItem",
+            "org.kde.StatusNotifierItem",
+        )
+        .unwrap();
+        assert_eq!(
+            item.get_property::<String>("Id").unwrap(),
+            "demo-success-moonboot"
+        );
+        assert_eq!(
+            item.get_property::<String>("Title").unwrap(),
+            "Moonboot DEMO"
+        );
+        let menu_path: OwnedObjectPath = item.get_property("Menu").unwrap();
+        let menu = Proxy::new(
+            &connection,
+            service.as_str(),
+            menu_path.as_str(),
+            "com.canonical.dbusmenu",
+        )
+        .unwrap();
+        type Layout = (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>);
+        let (_revision, (root, _, children)): (u32, Layout) = menu
+            .call("GetLayout", &(0_i32, -1_i32, Vec::<String>::new()))
+            .unwrap();
+        assert_eq!(root, 0);
+        assert_eq!(children.len(), 2, "tray must expose no power commands");
+        let mut quit_id = None;
+        for (child, expected) in children.into_iter().zip(["Open DEMO Controls", "Quit"]) {
+            let (id, properties, children): Layout = child.try_into().unwrap();
+            assert!(id > 0);
+            assert!(children.is_empty(), "unexpected command submenu");
+            assert_eq!(<&str>::try_from(&properties["label"]).unwrap(), expected);
+            // D-BusMenu omits default-valued properties; both default to true.
+            for name in ["enabled", "visible"] {
+                assert!(properties
+                    .get(name)
+                    .map(|value| bool::try_from(value).unwrap())
+                    .unwrap_or(true));
+            }
+            if expected == "Quit" {
+                quit_id = Some(id);
+            }
+        }
+        assert_idle(&mut process.0);
+        if generation == 0 {
+            watcher.close().unwrap();
+            wait_diagnostic(&mut process.0, 2);
+            assert!(!dbus
+                .name_has_owner("org.kde.StatusNotifierWatcher".try_into().unwrap())
+                .unwrap());
+        } else {
+            // Only Quit is activated: Open would launch graphical controls.
+            menu.call::<_, _, ()>(
+                "Event",
+                &(quit_id.unwrap(), "clicked", OwnedValue::from(0_i32), 0_u32),
+            )
+            .unwrap();
+            assert!(wait(&mut process.0).success());
+            watcher.close().unwrap();
+        }
+    }
+    let mut events = [0_u8; 4096];
+    assert_eq!(
+        unsafe {
+            libc::read(
+                observer.as_raw_fd(),
+                events.as_mut_ptr().cast(),
+                events.len(),
+            )
+        },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "tray opened config or credentials during watcher recovery"
+    );
+    assert!(!directory.join("moonboot-demo-success-ui.sock").exists());
 }

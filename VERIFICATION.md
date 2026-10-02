@@ -21,6 +21,7 @@ desktop applications were not used as test targets.
 | Packaged Moonlight Qt | 6.1.0; executable verified as `moonlight` |
 | Actual desktop Hyprland | 0.55.2 |
 | Actual desktop Waybar | 0.15.0 |
+| Actual notification daemon | Dunst 1.13.2 |
 | Actual desktop scale | 1.0 on 1920x1080 displays |
 
 The user's Waybar configuration includes `tray` in its enabled modules, and the
@@ -34,7 +35,7 @@ edit, Home Manager activation or NixOS rebuild was performed.
 | `nix develop` | Development shell realized and used for Rust commands |
 | `cargo fmt --check` | Passed |
 | `cargo clippy --all-targets -- -D warnings` | Passed |
-| `cargo test` | Passed: 51 library tests and 11 integration tests |
+| `cargo test` | Passed: 52 library tests and 12 integration tests |
 | `nix build --cores 6` | Passed; produces wrapped executable in `result/bin/moonboot` |
 | `nix flake check --keep-going --cores 6` | Passed: quality, package, source-safety and package-smoke |
 | Packaged `--help` / `--version` | Passed |
@@ -84,6 +85,13 @@ not reported as successful checks.
 - Headless lifecycle regressions for session preservation across panel destruction,
   Hide/Open/Close-event races, Quit during initialization and bounded child cleanup.
 - Isolated D-Bus inert tray startup and clean termination, without a real desktop.
+- Missing-watcher diagnostics, same-PID tray recovery after watcher appearance,
+  disconnect and replacement, exact DEMO menu/identity, no secret/config reads,
+  no UI/power operation, and Quit over the isolated D-Bus protocol. This recovery
+  regression was also repeated five times.
+- Successful notifier execution from a worker through absolute paths and PATH,
+  preserving literal message arguments. Packaged notifier smoke reaches a private
+  bus with a deliberately incompatible libnotify in the inherited library path.
 - Nix source-filter assertions reject synthetic secret paths and symlinks; the
   actual source output is checked for excluded config/credential/artifact paths.
 
@@ -99,6 +107,8 @@ were inspected; screenshots and one-off driver files remain outside the repo in
 Verified with the packaged demo:
 
 - Idle tray registers and publishes DEMO tooltip/menu, without opening a panel.
+- Before/after cropped Waybar images show the bundled crescent icon appearing
+  once; no Waybar restart or configuration change was needed.
 - Menu exposes Open DEMO Controls and Quit, with no one-click power action.
 - D-Bus menu Open creates one native Wayland panel with prominent DEMO labeling.
 - Start Session displays simulated progress and disables conflicting controls.
@@ -117,6 +127,9 @@ Verified with the packaged demo:
 - Cancel during simulated readiness stops waiting without reversing power.
 - Tray Quit closes/reaps its panel controller, including a simulated stream.
 - Error-state demo logs are private/bounded by implementation and automated tests.
+- DEMO failure notification reaches the existing Dunst daemon and visibly shows
+  the simulated-only warning. A filtered notification D-Bus trace and cropped
+  notification image were inspected; the daemon was not stopped or reconfigured.
 
 The native tests detected that Winit ignores `set_visible` on Wayland. The
 implementation was corrected to retain the controller/session but destroy and
@@ -125,16 +138,42 @@ close/Open race and forced-cleanup issue have dedicated automated regressions.
 The final built package's success and already-on desktop flows were retested
 after those changes.
 
+The follow-up desktop audit found an inherited-library packaging collision:
+OpenChamber's `LD_LIBRARY_PATH` selected another `libnotify.so.4`, and notify-send
+exited 127 before contacting D-Bus because GDK Pixbuf could not be loaded. The
+wrapper now prefers its packaged libnotify ahead of inherited directories while
+preserving the inherited path. A synthetic incompatible-library smoke check and
+real DEMO notification delivery passed after the fix.
+
+Parallel build load also exposed two fixture timing assumptions: the hung-process
+test allowed only 80 ms for cold exec before expecting emitted PIDs, and the
+missing-watcher test sampled a legitimate failed optional-notifier fork. The
+fixtures now allow a one-second exec budget and bounded notifier reaping,
+respectively; their process-cleanup assertions remain intact and repeat runs pass.
+
+## Home Manager Export Evaluation
+
+The actual `homeManagerModules.default` export, not a stand-in snippet, was
+evaluated with Home Manager 26.11 at revision
+`833540099ef43cbeb28b1e3f3c21901961edb48e` and the project's locked Nixpkgs.
+All 12 positive configurations passed: disabled, package-only, autostart-only,
+shortcut-only and both integrations, including hyprlang and Lua selections.
+Both integration-without-Hyprland cases failed with the intended assertion.
+
+Baseline comparisons confirmed the actual Moonboot package export, preserved
+existing compositor configuration, idle `tray` autostart and `gui` shortcut only,
+and no added power commands, credentials, services, portals or session environment
+changes. The generated Lua calls were checked against current official Hyprland
+documentation. This was evaluation only, not activation or a next-login test.
+
 ## Remaining Validation
 
-- Visual tray-icon placement, all display scales, and Waybar restart/recovery have
-  not been exhaustively checked. Tray D-Bus registration and menu functionality
-  were verified; no permission to restart Waybar was assumed.
-- Notification failure handling is automated. Actual notification-daemon visual
-  delivery has not been separately asserted or any daemon stopped for testing.
+- Other display scales and an actual Waybar restart have not been exhaustively
+  checked. The current icon placement and isolated watcher-protocol recovery were
+  verified; no permission to restart Waybar was assumed.
 - Autostart/shortcut snippets were not installed. Actual next-login behavior and
   user-chosen shortcut require opt-in configuration and a later login.
-- Optional Home Manager snippets were researched/evaluated with stand-in packages;
+- The actual exported Home Manager module was evaluated as described above;
   the user's system/module configuration was not activated or altered.
 - Real pairing/app-list output from a configured host remains unverified. Parsing
   was checked against upstream Moonlight source and fixtures, and the packaged

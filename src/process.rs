@@ -448,10 +448,11 @@ mod tests {
         }
         let (_directory, path) = script("sleep 30 &\nprintf '%s\\n%s\\n' \"$$\" \"$!\"\nwait");
         let begin = Instant::now();
+        // Allow cold fork/exec under parallel builds before asserting emitted PIDs.
         let output = probe(
             &path,
             "fake",
-            Duration::from_millis(80),
+            Duration::from_secs(1),
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -502,6 +503,35 @@ mod tests {
             preflight(&path, Duration::from_millis(30), &AtomicBool::new(false)),
             Err(Error::Dependency(_))
         ));
+    }
+
+    #[test]
+    fn successful_notifications_deliver_arguments_from_worker_and_path() {
+        if isolated_test(
+            "process::tests::successful_notifications_deliver_arguments_from_worker_and_path",
+        ) {
+            return;
+        }
+        let (directory, path) = script("printf '%s\\n' \"$@\" > \"$0.delivered\"");
+        let notifier = directory.path().join("notify-send");
+        fs::rename(path, &notifier).unwrap();
+        let delivered = directory.path().join("notify-send.delivered");
+        let message = "DEMO: simulated cloud failure; $(printf injected)";
+        let expected = format!("--\nMoonboot\n{message}\n");
+
+        notify_program(&notifier, message);
+        assert_eq!(fs::read_to_string(&delivered).unwrap(), expected);
+        fs::remove_file(&delivered).unwrap();
+
+        // Only this isolated test process changes PATH; the shebang is absolute.
+        let previous_path = std::env::var_os("PATH");
+        std::env::set_var("PATH", directory.path());
+        thread::spawn(move || notify(message)).join().unwrap();
+        match previous_path {
+            Some(path) => std::env::set_var("PATH", path),
+            None => std::env::remove_var("PATH"),
+        }
+        assert_eq!(fs::read_to_string(&delivered).unwrap(), expected);
     }
 
     #[test]
