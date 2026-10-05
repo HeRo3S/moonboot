@@ -293,13 +293,14 @@ impl Drop for Instance {
 }
 
 enum Source {
-    Production(Arc<Config>),
+    Production(Arc<Mutex<Option<Config>>>),
     Demo(Arc<Mutex<Demo>>),
 }
 
 pub struct Session {
     pub model: Arc<Mutex<Model>>,
     source: Option<Source>,
+    config_path: Option<PathBuf>,
     cancel: Arc<AtomicBool>,
     end_stream: Arc<AtomicBool>,
     quit: Arc<AtomicBool>,
@@ -336,7 +337,7 @@ impl Session {
                         config.tuya.device_id.clone(),
                         None,
                     ),
-                    Some(Source::Production(Arc::new(config))),
+                    Some(Source::Production(Arc::new(Mutex::new(Some(config))))),
                 ),
                 Err(error) => {
                     report_failure(&error, None);
@@ -348,13 +349,28 @@ impl Session {
                     );
                     model.error = Some(error.to_string());
                     model.configured = false;
-                    (model, None)
+                    let baseline = match Config::draft(path) {
+                        Ok(config) => Some(config),
+                        Err(error) => {
+                            model.error = Some(format!("Cannot safely inspect configuration: {error}. Saving is blocked; repair the selected file and Reload from disk."));
+                            None
+                        }
+                    };
+                    (
+                        model,
+                        Some(Source::Production(Arc::new(Mutex::new(baseline)))),
+                    )
                 }
             }
         };
         Self {
             model: Arc::new(Mutex::new(model)),
             source,
+            config_path: if demo.is_none() {
+                Config::path(path).ok()
+            } else {
+                None
+            },
             cancel: Arc::new(AtomicBool::new(false)),
             end_stream: Arc::new(AtomicBool::new(false)),
             quit,
@@ -367,6 +383,10 @@ impl Session {
 
     pub fn action(&mut self, action: Action) {
         match action {
+            Action::OpenSettings => self.open_settings(),
+            Action::SaveSettings => self.save_settings(),
+            Action::ReloadSettings => self.reload_settings(),
+            Action::CancelSettings => self.model.lock().unwrap().discard_settings(&self.ctx),
             Action::Run(operation) => self.start(operation),
             Action::Cancel => {
                 self.cancel.store(true, Ordering::Relaxed);
@@ -376,7 +396,10 @@ impl Session {
                 self.end_stream.store(true, Ordering::Relaxed);
             }
             Action::Hide => {
-                self.model.lock().unwrap().set_visible(false);
+                let mut model = self.model.lock().unwrap();
+                model.discard_settings(&self.ctx);
+                model.set_visible(false);
+                drop(model);
                 self.desired_visible.store(false, Ordering::Relaxed);
                 if let Some(ctx) = &self.window_ctx {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -386,7 +409,10 @@ impl Session {
             Action::Quit => {
                 self.quit.store(true, Ordering::Relaxed);
                 self.cancel.store(true, Ordering::Relaxed);
-                self.model.lock().unwrap().set_visible(false);
+                let mut model = self.model.lock().unwrap();
+                model.discard_settings(&self.ctx);
+                model.set_visible(false);
+                drop(model);
                 self.desired_visible.store(false, Ordering::Relaxed);
                 if let Some(ctx) = &self.window_ctx {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -394,6 +420,163 @@ impl Session {
                 }
             }
         }
+    }
+
+    fn open_settings(&mut self) {
+        if self.quit.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(Source::Production(active)) = &self.source else {
+            return;
+        };
+        let config = active.lock().unwrap().clone();
+        let mut model = self.model.lock().unwrap();
+        if !model.settings_allowed() {
+            return;
+        }
+        let Some(path) = &self.config_path else {
+            model.error = Some(
+                "Cannot resolve configuration location; supply an absolute --config path.".into(),
+            );
+            return;
+        };
+        model.discard_settings(&self.ctx);
+        let unknown = config.is_none();
+        let mut draft = crate::ui::settings::Draft::new(config.unwrap_or_default(), path.clone());
+        if unknown {
+            draft.save_blocked = true;
+            draft.warning = Some("No safely observed configuration is available. Saving is blocked; repair the selected file and Reload from disk before saving or running operations.".into());
+        }
+        model.settings = Some(draft);
+    }
+
+    fn save_settings(&mut self) {
+        if self.quit.load(Ordering::Relaxed) {
+            return;
+        }
+        // Reject forged demo actions before resolving paths or touching the filesystem.
+        let Some(Source::Production(active)) = &self.source else {
+            return;
+        };
+        if active.lock().unwrap().is_none() {
+            return;
+        }
+        let Some(path) = self.config_path.clone() else {
+            return;
+        };
+        let mut config = {
+            let mut model = self.model.lock().unwrap();
+            if !model.settings_allowed() {
+                return;
+            }
+            let Some(draft) = &model.settings else {
+                return;
+            };
+            if draft.save_blocked {
+                return;
+            }
+            let config = draft.config.clone();
+            model.busy = true;
+            model.message = "Saving configuration locally...".into();
+            config
+        };
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        let active = active.clone();
+        let model = self.model.clone();
+        let ctx = self.ctx.clone();
+        self.worker = Some(thread::spawn(move || {
+            let result = (|| {
+                let _lock = backend::operation_lock("operation")?;
+                let outcome = config.save(Some(&path))?;
+                *active.lock().unwrap() = if outcome.requires_reload {
+                    None
+                } else {
+                    Some(config.clone())
+                };
+                Ok::<_, Error>(outcome)
+            })();
+            let mut model = model.lock().unwrap();
+            match result {
+                Ok(outcome) => model.settings_saved(config, outcome, path, &ctx),
+                Err(error) => {
+                    let message = format!("Settings were not saved: {error}. Reload from disk after external edits or retargeting. For read-only agenix/Nix targets, edit the encrypted/declarative source and redeploy; for a busy operation, wait and retry.");
+                    if let Some(draft) = &mut model.settings {
+                        draft.error = Some(message.clone());
+                    }
+                    model.error = Some(message);
+                    model.message = "Configuration unchanged; correct Settings and retry, or Cancel to discard the draft.".into();
+                }
+            }
+            model.busy = false;
+            drop(model);
+            ctx.request_repaint();
+        }));
+    }
+
+    fn reload_settings(&mut self) {
+        if self.quit.load(Ordering::Relaxed) {
+            return;
+        }
+        // Demo actions must return before even looking up a production path.
+        let Some(Source::Production(active)) = &self.source else {
+            return;
+        };
+        let Some(path) = self.config_path.clone() else {
+            return;
+        };
+        {
+            let mut model = self.model.lock().unwrap();
+            if !model.settings_allowed() || model.settings.is_none() {
+                return;
+            }
+            model.busy = true;
+            model.message = "Reloading configuration locally...".into();
+        }
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+        let active = active.clone();
+        let model = self.model.clone();
+        let ctx = self.ctx.clone();
+        self.worker = Some(thread::spawn(move || {
+            let result = (|| {
+                let _lock = backend::operation_lock("operation")?;
+                let config = Config::load(Some(&path))?;
+                *active.lock().unwrap() = Some(config.clone());
+                Ok::<_, Error>(config)
+            })();
+            let mut model = model.lock().unwrap();
+            match result {
+                Ok(config) => {
+                    model.host = config.moonlight.host.clone();
+                    model.app = config.moonlight.app.clone();
+                    model.device = config.tuya.device_id.clone();
+                    model.status = None;
+                    model.configured = true;
+                    model.error = None;
+                    model.message =
+                        "Configuration reloaded. Status is Unknown until explicitly refreshed."
+                            .into();
+                    if model.settings.is_some() {
+                        model.discard_settings(&ctx);
+                        model.settings = Some(crate::ui::settings::Draft::new(config, path));
+                    }
+                }
+                Err(error) => {
+                    let message = format!("Settings were not reloaded: {error}. Active configuration and unsaved edits are unchanged; check the deployed configuration or wait for the current operation and retry.");
+                    if let Some(draft) = &mut model.settings {
+                        draft.error = Some(message.clone());
+                    }
+                    model.error = Some(message);
+                    model.message = "Configuration unchanged; reload failed.".into();
+                }
+            }
+            model.busy = false;
+            drop(model);
+            ctx.request_repaint();
+        }));
     }
 
     pub fn open(&mut self) {
@@ -425,13 +608,18 @@ impl Session {
         }
         {
             let mut model = self.model.lock().unwrap();
-            if model.busy {
+            if model.busy
+                || !model.configured
+                || model.phase != Phase::Idle
+                || model.settings.is_some()
+            {
                 return;
             }
             model.busy = true;
             model.error = None;
             model.message = "Validating requested operation...".into();
             model.decline();
+            model.discard_settings(&self.ctx);
         }
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
@@ -474,7 +662,15 @@ impl Session {
             };
             let result = match source {
                 Source::Production(config) => {
-                    backend::run(&config, operation, cancel.clone(), emit, approve)
+                    let config = config.lock().unwrap().clone();
+                    match config {
+                        Some(config) => {
+                            backend::run(&config, operation, cancel.clone(), emit, approve)
+                        }
+                        None => Err(Error::Config(
+                            "No active configuration; open Settings.".into(),
+                        )),
+                    }
                 }
                 Source::Demo(demo) => demo
                     .lock()
@@ -495,6 +691,7 @@ impl Drop for Session {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
         self.model.lock().unwrap().decline();
+        self.model.lock().unwrap().discard_settings(&self.ctx);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }

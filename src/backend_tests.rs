@@ -13,7 +13,8 @@ fn config() -> Config {
             endpoint: "https://example.invalid".into(),
             device_id: "fake-device".into(),
             switch_code: "switch_1".into(),
-            credentials_file: "/not-read-in-tests".into(),
+            credentials_file: Some("/not-read-in-tests".into()),
+            ..Tuya::default()
         },
         moonlight: Moonlight {
             executable: "fake-moonlight".into(),
@@ -28,6 +29,7 @@ fn config() -> Config {
             http_timeout_seconds: 2,
         },
         notifications: Notifications { enabled: false },
+        ..Config::default()
     }
 }
 
@@ -511,8 +513,9 @@ fn public_run_child_boundary() {
     };
     let mut config = config();
     config.moonlight.executable = "/definitely-missing-test-moonlight".into();
-    config.tuya.credentials_file =
-        PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap()).join("missing-test-credentials");
+    config.tuya.credentials_file = Some(
+        PathBuf::from(std::env::var_os("XDG_STATE_HOME").unwrap()).join("missing-test-credentials"),
+    );
     let events = RefCell::new(vec![]);
     let operation = if case == "missing-credentials" {
         Operation::PlugOff

@@ -1,15 +1,12 @@
 use crate::{
     backend::{cancelled, Error},
-    config::Tuya,
+    config::{read_private_file, Tuya},
 };
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::OpenOptions,
-    io::Read,
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
     sync::atomic::AtomicBool,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -25,33 +22,7 @@ struct Credentials {
 
 impl Credentials {
     fn load(path: &std::path::Path) -> Result<Self, Error> {
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-            .open(path)
-            .map_err(|_| {
-                Error::Config(
-                    "Cannot open credentials file; use a private regular file, not a symlink"
-                        .into(),
-                )
-            })?;
-        let m = file
-            .metadata()
-            .map_err(|_| Error::Config("Cannot inspect credentials file".into()))?;
-        if !m.is_file()
-            || m.uid() != unsafe { libc::geteuid() }
-            || m.mode() & 0o777 != 0o600
-            || m.nlink() != 1
-        {
-            return Err(Error::Config("Credentials must be owned by this user, mode 0600, regular, and not hard-linked; do not use the Nix store".into()));
-        }
-        let mut text = String::new();
-        file.take(16385)
-            .read_to_string(&mut text)
-            .map_err(|_| Error::Config("Cannot read credentials".into()))?;
-        if text.len() > 16384 {
-            return Err(Error::Config("Credentials file is too large".into()));
-        }
+        let text = read_private_file(path, 16384)?;
         let credentials: Self = toml::from_str(&text).map_err(|_| {
             Error::Config("Invalid credentials TOML; expected client_id and client_secret".into())
         })?;
@@ -273,9 +244,17 @@ pub(crate) struct Cloud<T> {
 
 impl Cloud<Http> {
     pub(crate) fn new(config: &Tuya, timeout: Duration) -> Result<Self, Error> {
+        config.validate_credentials()?;
+        let credentials = match &config.credentials_file {
+            Some(path) => Credentials::load(path)?,
+            None => Credentials {
+                client_id: config.client_id.clone(),
+                client_secret: config.client_secret.clone(),
+            },
+        };
         Ok(Self {
             transport: Http::new(&config.endpoint, timeout)?,
-            credentials: Credentials::load(&config.credentials_file)?,
+            credentials,
             config: config.clone(),
             token: String::new(),
         })
@@ -465,7 +444,7 @@ mod tests {
     use super::*;
     use std::{
         collections::VecDeque,
-        io::Write,
+        io::{Read, Write},
         net::{TcpListener, TcpStream},
         os::unix::fs::{symlink, PermissionsExt},
         sync::{atomic::Ordering, mpsc, Arc, Mutex},
@@ -913,6 +892,7 @@ mod tests {
                         http_timeout_seconds: 86400,
                     },
                     notifications: Notifications { enabled: false },
+                    ..Config::default()
                 };
                 let directory = tempfile::tempdir().unwrap();
                 std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
@@ -1062,7 +1042,8 @@ mod tests {
                 endpoint: "https://example.invalid".into(),
                 device_id: "fake".into(),
                 switch_code: "switch_1".into(),
-                credentials_file: "/never-read".into(),
+                credentials_file: Some("/never-read".into()),
+                ..Tuya::default()
             },
             token: String::new(),
         }
@@ -1195,7 +1176,11 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert!(Credentials::load(&path).is_ok());
         symlink(&path, dir.path().join("link")).unwrap();
-        assert!(Credentials::load(&dir.path().join("link")).is_err());
+        assert!(Credentials::load(&dir.path().join("link")).is_ok());
+        symlink("link", dir.path().join("chain")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(Credentials::load(&dir.path().join("chain")).is_ok());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         std::fs::hard_link(&path, dir.path().join("hard")).unwrap();
         assert!(Credentials::load(&path).is_err());
         std::fs::remove_file(dir.path().join("hard")).unwrap();
@@ -1205,6 +1190,38 @@ mod tests {
             .unwrap()
             .to_string()
             .contains("SECRET SOURCE LINE"));
+    }
+
+    #[test]
+    fn inline_and_legacy_credentials_share_cloud_and_signing() {
+        let mut config = Tuya {
+            endpoint: "https://example.invalid".into(),
+            device_id: "synthetic-device".into(),
+            switch_code: "switch_1".into(),
+            client_id: "synthetic-id".into(),
+            client_secret: "synthetic-secret".into(),
+            credentials_file: None,
+        };
+        let inline = Cloud::new(&config, Duration::from_secs(1)).unwrap();
+        assert_eq!(inline.credentials.client_id, "synthetic-id");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials");
+        std::fs::write(
+            &path,
+            "client_id='synthetic-id'\nclient_secret='synthetic-secret'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        config.credentials_file = Some(path);
+        assert!(Cloud::new(&config, Duration::from_secs(1)).is_err());
+        config.client_id.clear();
+        config.client_secret.clear();
+        let external = Cloud::new(&config, Duration::from_secs(1)).unwrap();
+        assert_eq!(external.credentials.client_id, inline.credentials.client_id);
+        assert_eq!(
+            external.credentials.client_secret,
+            inline.credentials.client_secret
+        );
     }
 
     #[test]
@@ -1278,6 +1295,7 @@ mod tests {
                     http_timeout_seconds: 1,
                 },
                 notifications: Notifications { enabled: false },
+                ..Config::default()
             };
             let mut host = Host { launched: 0 };
             workflow(

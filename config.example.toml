@@ -2,19 +2,13 @@
 endpoint = "https://REPLACE_WITH_YOUR_TUYA_REGIONAL_ENDPOINT"
 device_id = "REPLACE_WITH_PLUG_DEVICE_ID"
 switch_code = "REPLACE_WITH_SUPPORTED_BOOLEAN_SWITCH_CODE"
-credentials_file = "/absolute/path/outside/repo/private-tuya-credentials.toml"
+client_id = "REPLACE_WITH_TUYA_PROJECT_ACCESS_ID"
+client_secret = "REPLACE_WITH_TUYA_PROJECT_ACCESS_SECRET"
 
 [moonlight]
-executable = "moonlight"
 host = "REPLACE_WITH_HOST_IP_OR_NAME"
-app = "Desktop"
-stream_args = []
 
-[startup]
-timeout_seconds = 180
-poll_interval_seconds = 3
-probe_timeout_seconds = 10
-http_timeout_seconds = 10
-
-[notifications]
-enabled = true
+# Defaults: executable = "moonlight", app = "Desktop", stream_args = [].
+# Startup defaults: timeout 180s, polling 3s, probe/HTTP timeout 10s.
+# Notifications default to enabled. Configure these in the app's Advanced settings.
+# This is a placeholder example. Real inline credentials require mode 0600 or 0400.
