@@ -244,3 +244,18 @@ sandbox; ordinary private/unsafe modes remain exercised, and the complete mode
 fixture runs in the normal development-shell test suite. Directory-lock fixtures
 run in isolated test processes so unrelated parallel fork/exec tests cannot
 briefly retain their lock descriptors.
+
+## Quiet Tray Startup Regression
+
+The tray-host offline callback previously emitted the generic Controls failed
+notification even though it retained the controller and waited for recovery.
+That recoverable lifecycle state now writes a waiting notice to the journal and
+private frontend log, without a desktop notification. Watcher recovery records
+an informational registration notice. Genuine control/configuration failures
+retain their normal failure notification path.
+
+The isolated D-Bus watcher-recovery test now supplies a working fake notify-send
+and verifies zero invocations during startup without a watcher, watcher loss and
+replacement. It still verifies same-PID re-registration, idle hardware isolation
+and graceful Quit. The real Waybar and installed Moonboot service were not
+restarted or reconfigured for this regression.
