@@ -35,9 +35,9 @@ edit, Home Manager activation or NixOS rebuild was performed.
 | `nix develop` | Development shell realized and used for Rust commands |
 | `cargo fmt --check` | Passed |
 | `cargo clippy --all-targets -- -D warnings` | Passed |
-| `cargo test` | Passed: 52 library tests and 12 integration tests |
+| `cargo test` | Passed: 72 library tests and 18 integration tests |
 | `nix build --cores 6` | Passed; produces wrapped executable in `result/bin/moonboot` |
-| `nix flake check --keep-going --cores 6` | Passed: quality, package, source-safety and package-smoke |
+| `nix flake check --keep-going --cores 6` | Passed: quality, package, source-safety, package-smoke and NixOS modules |
 | Packaged `--help` / `--version` | Passed |
 | Packaged idle demo tray with minimal PATH on isolated D-Bus | Passed in flake check |
 | `git diff --check` | Passed |
@@ -186,3 +186,61 @@ documentation. This was evaluation only, not activation or a next-login test.
 Mandatory hardware-free checks and documented demo mode are complete. Mocks and
 native simulated desktop sessions do **not** establish real plug, BIOS,
 Sunshine or streaming success.
+
+## Configuration Feedback Revision
+
+Follow-up implementation and checks on 2026-10-05 address unified configuration,
+in-app editing, editable dotfile symlinks, agenix, and system-installed Hyprland.
+The original desktop evidence above remains separate from these checks.
+
+- The preferred file now includes both Tuya credentials alongside the plug and
+  Moonlight fields. Startup, notifications and Moonlight defaults can be omitted.
+  Existing external-credentials references remain supported without mixing them
+  with inline credentials.
+- Private target reads accept user-owned mode-0400 or mode-0600 regular files
+  through file/directory/relative symlink chains, while rejecting unsafe modes,
+  hard links, nonregular files and inline credentials in the Nix store.
+- Settings is available before setup, masks both credential fields, retains no
+  password undo state, disables launcher controls while editing, and supports
+  Save/Cancel/Reload without cloud or power actions. Demo Settings actions remain
+  isolated and cannot open or write production files.
+- Save preserves symlinks and uses private atomic target writes. Source-version
+  checks reject stale drafts, retargeting and competing creation. Deterministic
+  tests exercise displaced-file backups, post-commit races and directory-sync
+  warnings; unverifiable selections disable operations until explicit Reload.
+- Read-only agenix/Nix targets and encrypted `.age` sources cannot be written by
+  Settings. Reload accepts redeployed private files without reading any referenced
+  external credentials file. No agenix encryption/decryption command, private key,
+  encrypted user secret or runtime user credential was accessed during testing.
+- Both `nixosModules.default` and `homeManagerModules.default` are exported.
+  System Hyprland/UWSM uses a session-scoped idle user service without claiming
+  the linked compositor tree. Shortcut fragments are opt-in and user-sourced.
+  Same-user duplicate autostart is rejected without blocking a different user.
+- The committed Nix evaluation harness passed all 18 real NixOS/Home Manager
+  cases with HM revision `f53f3267f5d009dd8f99443505e609389d7ff267`. The six NixOS-only
+  cases are included in the hardware-free flake checks. No module was activated.
+
+Reproduce the additional real Home Manager evaluation without installing it:
+
+```sh
+nix eval --impure --json --file nix/tests/default.nix \
+  --apply 'test: test { homeManager = builtins.getFlake "github:nix-community/home-manager/f53f3267f5d009dd8f99443505e609389d7ff267"; }'
+```
+
+Native Settings inspection uses only synthetic configuration and a private
+temporary runtime/HOME namespace with an absolute Wayland display socket. It
+never selects the user's configuration or starts a cloud/power operation.
+The masked-field layout was inspected in the packaged native panel. Keyboard
+editing and a successful symlink-preserving Save were exercised in the native
+development build, with launcher controls disabled while editing. A subsequent
+packaged keyboard run stopped on its focus guard while the live desktop focus
+was changing; it is not claimed as a completed packaged-native Save test. The
+complete editor/controller/file path is also covered by the headless interaction
+suite. No automated input was redirected to another window after a guard failure.
+
+An initial Nix build rejected creating a setuid-mode permission fixture with
+`EPERM`. That specific fixture is permitted to be unavailable in the restricted
+sandbox; ordinary private/unsafe modes remain exercised, and the complete mode
+fixture runs in the normal development-shell test suite. Directory-lock fixtures
+run in isolated test processes so unrelated parallel fork/exec tests cannot
+briefly retain their lock descriptors.

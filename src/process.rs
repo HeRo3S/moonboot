@@ -584,7 +584,8 @@ mod tests {
                 endpoint: "https://example.invalid".into(),
                 device_id: "fake".into(),
                 switch_code: "switch".into(),
-                credentials_file: "/never-read".into(),
+                credentials_file: Some("/never-read".into()),
+                ..Tuya::default()
             },
             moonlight: Moonlight {
                 executable: "unused".into(),
@@ -599,6 +600,7 @@ mod tests {
                 http_timeout_seconds: 1,
             },
             notifications: Notifications { enabled: false },
+            ..Config::default()
         }
     }
 

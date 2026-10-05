@@ -11,8 +11,8 @@
         "Cargo.toml" "Cargo.lock"
         "src/lib.rs" "src/main.rs" "src/backend.rs" "src/backend_tests.rs"
         "src/config.rs" "src/cloud.rs" "src/process.rs" "src/ui.rs"
-        "src/controller.rs" "src/demo.rs"
-        "tests/ui.rs" "tests/cli.rs" "tests/controller.rs"
+        "src/controller.rs" "src/demo.rs" "src/settings.rs"
+        "tests/ui.rs" "tests/cli.rs" "tests/controller.rs" "tests/settings.rs"
       ];
       sourceFilter = path: type:
         let relative = lib.removePrefix "${toString ./.}/" (toString path);
@@ -96,8 +96,14 @@
       checks.${system} = {
         inherit quality;
         package = moonboot;
+        nixos-modules = let
+          results = import ./nix/tests/eval.nix { flake = self; inherit nixpkgs system; };
+        in assert builtins.all (result: result) (builtins.attrValues results);
+          pkgs.runCommand "moonboot-nixos-modules" { } ''mkdir -p "$out"'';
         source-safety = assert builtins.all (relative: !(sourceFilter "${toString ./.}/${relative}" "regular")) [
           "credentials.toml" "src/secret.rs" "src/credentials.toml" ".env" "target/debug/moonboot" "config.toml"
+          "nix/modules/common.nix" "nix/modules/home-manager.nix" "nix/modules/nixos.nix"
+          "nix/tests/eval.nix" "nix/tests/default.nix"
         ]; assert !(sourceFilter "${toString ./.}/src/main.rs" "symlink");
         pkgs.runCommand "moonboot-source-safety" { } ''
           test ! -e ${src}/credentials.toml
@@ -144,42 +150,11 @@
           mkdir -p "$out"
         '';
       };
-      homeManagerModules.default = { config, lib, pkgs, ... }:
-        let
-          cfg = config.programs.moonboot;
-          exe = lib.getExe cfg.package;
-          lua = config.wayland.windowManager.hyprland.configType == "lua";
-        in {
-          options.programs.moonboot = {
-            enable = lib.mkEnableOption "Moonboot";
-            package = lib.mkOption {
-              type = lib.types.package;
-              default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
-            };
-            autostart = lib.mkEnableOption "idle tray startup with Hyprland";
-            shortcut = lib.mkEnableOption "SUPER M controls shortcut (example binding)";
-          };
-          config = lib.mkIf cfg.enable {
-            home.packages = [ cfg.package ];
-            assertions = [{
-              assertion = !(cfg.autostart || cfg.shortcut) || config.wayland.windowManager.hyprland.enable;
-              message = "Moonboot autostart/shortcut requires Home Manager Hyprland to be enabled";
-            }];
-            wayland.windowManager.hyprland.extraConfig = lib.mkIf (cfg.autostart || cfg.shortcut) (lib.mkAfter (
-              if lua then
-                lib.optionalString cfg.autostart ''
-                  hl.on("hyprland.start", function() hl.exec_cmd("${exe} tray") end)
-                '' + lib.optionalString cfg.shortcut ''
-                  hl.bind("SUPER + M", hl.dsp.exec_cmd("${exe} gui"))
-                ''
-              else
-                lib.optionalString cfg.autostart ''
-                  exec-once = ${exe} tray
-                '' + lib.optionalString cfg.shortcut ''
-                  bind = SUPER, M, exec, ${exe} gui
-                ''
-            ));
-          };
-        };
+      homeManagerModules.default = import ./nix/modules/home-manager.nix {
+        defaultPackage = pkgs: self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+      };
+      nixosModules.default = import ./nix/modules/nixos.nix {
+        defaultPackage = pkgs: self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+      };
     };
 }
