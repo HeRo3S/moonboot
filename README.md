@@ -260,7 +260,10 @@ production/demo namespace. Neither shuts down the host or cuts AC power.
 The tray and panel have separate per-user locks; idle UI never holds the operation
 lock. Private mode-0600 IPC checks the peer UID and accepts only Open/Quit, never
 Start or off authorization. A missing tray host logs an actionable diagnostic
-and waits for recovery; use `moonboot gui` rather than expecting a login window.
+and waits for recovery without a desktop failure notification; use `moonboot gui`
+rather than expecting a login window. Moonboot and Waybar may start concurrently
+at login. The tray registers when Waybar's watcher becomes available and resumes
+registration after a bar restart; no fixed startup delay is required.
 
 Best-effort `notify-send` notifications do not gate session success. Failures are
 also recorded in bounded private `backend.log`/`frontend.log` under

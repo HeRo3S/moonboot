@@ -539,11 +539,38 @@ fn tray_recovery_child() {
         );
     }
     let stderr = directory.join("tray-stderr");
+    let notifications = directory.join("notification-calls");
+    let notifier_directory = directory.join("notifiers");
+    fs::create_dir(&notifier_directory).unwrap();
+    let notifier = notifier_directory.join("notify-send");
+    let shell = std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .map(|path| path.join("sh"))
+        .find(|path| path.is_file())
+        .expect("tray recovery test requires a POSIX shell");
+    fs::write(
+        &notifier,
+        format!(
+            "#!{}\nprintf 'called\\n' >> \"$MOONBOOT_NOTIFICATION_LOG\"\n",
+            shell.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&notifier, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(Command::new(&notifier)
+        .env("MOONBOOT_NOTIFICATION_LOG", &notifications)
+        .status()
+        .unwrap()
+        .success());
+    assert!(notifications.exists(), "notifier fixture must record calls");
+    fs::remove_file(&notifications).unwrap();
     let mut process = TestProcess(
         Command::new(env!("CARGO_BIN_EXE_moonboot"))
             .args(["tray", "--demo", "success", "--config"])
             .arg(&config)
-            .env("PATH", "/nonexistent-test-path")
+            .env("PATH", &notifier_directory)
+            .env("MOONBOOT_NOTIFICATION_LOG", &notifications)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(File::create(&stderr).unwrap())
@@ -554,8 +581,6 @@ fn tray_recovery_child() {
     let assert_idle = |process: &mut Child| {
         assert_eq!(process.id(), pid);
         assert!(process.try_wait().unwrap().is_none(), "tray exited");
-        // Missing-host diagnostics may briefly attempt the optional notifier.
-        // Wait for that failed exec to be reaped, rather than racing its fork.
         let deadline = Instant::now() + Duration::from_secs(1);
         loop {
             if fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
@@ -568,6 +593,10 @@ fn tray_recovery_child() {
             assert!(Instant::now() < deadline, "tray retained a child process");
             thread::sleep(Duration::from_millis(10));
         }
+        assert!(
+            !notifications.exists(),
+            "recoverable tray-host loss must not notify"
+        );
         for name in [
             "moonboot-ui.sock",
             "moonboot-demo-success-ui.sock",
@@ -693,6 +722,15 @@ fn tray_recovery_child() {
             watcher.close().unwrap();
         }
     }
+    assert!(
+        !notifications.exists(),
+        "startup and recovery must stay silent"
+    );
+    let frontend =
+        fs::read_to_string(directory.join("demo-success-moonboot/frontend.log")).unwrap();
+    assert!(frontend.contains("waiting Tray host unavailable."));
+    assert!(frontend.contains("info Tray host available; resuming Moonboot icon registration."));
+    assert!(!frontend.contains("Dependency error: Tray host unavailable"));
     let mut events = [0_u8; 4096];
     assert_eq!(
         unsafe {

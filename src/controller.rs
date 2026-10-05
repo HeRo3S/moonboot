@@ -39,6 +39,15 @@ pub fn signal_flag() -> Result<Arc<AtomicBool>, Error> {
 
 /// Frontend failures can occur before the backend has a configuration to log with.
 pub fn report_failure(error: &Error, demo: Option<Scenario>) {
+    log_frontend(&format!("{} {error}", error.code()), demo);
+    crate::process::notify(if demo.is_some() {
+        "DEMO: simulated operation or controls failed. Open DEMO Controls for details; no real power or network actions occurred."
+    } else {
+        "Controls failed. Open Moonboot or run moonboot gui in a terminal for details. Power is never automatically reversed."
+    });
+}
+
+fn log_frontend(message: &str, demo: Option<Scenario>) {
     let base = std::env::var_os("XDG_STATE_HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
@@ -92,7 +101,7 @@ pub fn report_failure(error: &Error, demo: Option<Scenario>) {
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
-            let message = format!("{timestamp} {} {error}\n", error.code());
+            let message = format!("{timestamp} {message}\n");
             if message.len() > 4096 {
                 return Ok(());
             }
@@ -102,11 +111,6 @@ pub fn report_failure(error: &Error, demo: Option<Scenario>) {
             file.write_all(message.as_bytes())
         })();
     }
-    crate::process::notify(if demo.is_some() {
-        "DEMO: simulated operation or controls failed. Open DEMO Controls for details; no real power or network actions occurred."
-    } else {
-        "Controls failed. Open Moonboot or run moonboot gui in a terminal for details. Power is never automatically reversed."
-    });
 }
 
 pub fn namespace(demo: Option<Scenario>, suffix: &str) -> String {
@@ -885,14 +889,16 @@ impl ksni::Tray for Tray {
         ]
     }
     fn watcher_offline(&self, _: ksni::OfflineReason) -> bool {
-        eprintln!("Tray host unavailable. Enable Waybar's tray module or use moonboot gui; waiting for tray host recovery.");
-        report_failure(
-            &Error::Dependency(
-                "Tray host unavailable; enable Waybar's tray module or use moonboot gui".into(),
-            ),
-            self.demo,
-        );
+        let message = "Tray host unavailable. Enable Waybar's tray module or use moonboot gui; waiting for tray host recovery.";
+        eprintln!("{message}");
+        // Waybar can start after the tray, or restart while the controller stays alive.
+        log_frontend(&format!("waiting {message}"), self.demo);
         true
+    }
+    fn watcher_online(&self) {
+        let message = "Tray host available; resuming Moonboot icon registration.";
+        eprintln!("{message}");
+        log_frontend(&format!("info {message}"), self.demo);
     }
 }
 
